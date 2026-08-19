@@ -3,7 +3,7 @@
 # remnaundersettings — надстройка над install_remnawave.sh (eGamesAPI)
 # для нод Remnawave на Xray-core.
 #
-# Версия 3.5.1
+# Версия 3.5.2
 #
 #
 # НАЗНАЧЕНИЕ
@@ -85,7 +85,7 @@
 #
 set -uo pipefail
 
-VERSION="3.5.1"
+VERSION="3.5.2"
 SELF_NAME="remnaundersettings.sh"
 SELF_PATH="/usr/local/bin/$SELF_NAME"
 SHORTCUT="/usr/local/bin/srus"
@@ -607,6 +607,29 @@ resolve_certs() {
   return 0
 }
 
+compose_service() {
+  local cf="$1" s
+  for s in remnanode remnawave-node node; do
+    grep -qE "^[[:space:]][[:space:]]${s}:[[:space:]]*$" "$cf" && { printf '%s' "$s"; return 0; }
+  done
+  s=$(awk '/^[[:space:]][[:space:]][a-zA-Z0-9_-]+:[[:space:]]*$/ {
+        svc=$0; sub(/^[[:space:]]+/,"",svc); sub(/:.*$/,"",svc) }
+      /remnawave\/node/ { print svc; exit }' "$cf")
+  printf '%s' "${s:-remnanode}"
+}
+
+service_has_mount() {
+  local cf="$1" svc="$2" needle="$3"
+  awk -v svc="$svc" -v needle="$needle" '
+    /^[[:space:]][[:space:]][a-zA-Z0-9_-]+:[[:space:]]*$/ {
+      line=$0; sub(/^[[:space:]]+/,"",line); sub(/:.*$/,"",line)
+      inside = (line == svc)
+    }
+    inside && index($0, needle) { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' "$cf"
+}
+
 cert_visible_in_container() {
   have_node_container || return 0
   [[ -n "$CERT_IN_CONTAINER" ]] || return 1
@@ -639,33 +662,39 @@ do_certs() {
   [[ -f "$cf" ]] || { warn "$cf не найден — пропускаю патч compose"; return 0; }
 
   local mount="- '${MOUNT_SRC}:${MOUNT_DST}:ro'"
-  if grep -qF "${MOUNT_SRC}:${MOUNT_DST}" "$cf"; then
-    ok "Volume уже смонтирован"
+  local svc; svc=$(compose_service "$cf")
+
+  if service_has_mount "$cf" "$svc" "${MOUNT_SRC}:${MOUNT_DST}"; then
+    ok "Volume уже смонтирован в сервис $svc"
   elif (( DRY_RUN )); then
-    dim "dry-run: добавил бы в $cf строку  $mount"
+    dim "dry-run: добавил бы в сервис $svc файла $cf строку  $mount"
   else
     mkdir -p "$BACKUP_DIR"
     cp -a "$cf" "$BACKUP_DIR/docker-compose.yml.$(date +%Y%m%d-%H%M%S)"
 
     local rc=0
-    awk -v m="$mount" '
-      BEGIN { done=0 }
-      /^[[:space:]]*volumes:[[:space:]]*$/ && !done {
-        print; match($0, /^[[:space:]]*/); ind=RLENGTH
-        printf "%*s%s\n", ind+2, "", m; done=1; next
+    awk -v m="$mount" -v svc="$svc" '
+      BEGIN { done=0; inside=0 }
+      /^[[:space:]][[:space:]][a-zA-Z0-9_-]+:[[:space:]]*$/ {
+        line=$0; sub(/^[[:space:]]+/, "", line); sub(/:.*$/, "", line)
+        inside = (line == svc)
       }
       { print }
+      inside && /^[[:space:]]*volumes:[[:space:]]*$/ && !done {
+        match($0, /^[[:space:]]*/); ind=RLENGTH
+        printf "%*s%s\n", ind+2, "", m; done=1
+      }
       END { if (!done) exit 3 }
     ' "$cf" >"$cf.new" || rc=$?
 
     if (( rc != 0 )); then
       rm -f "$cf.new"
-      warn "Блок volumes: в compose не нашёл. Добавь руками:"
+      warn "Блок volumes: в сервисе $svc не нашёл. Добавь руками:"
       echo "    volumes:"; echo "      $mount"
       return 1
     fi
     mv "$cf.new" "$cf"
-    ok "Volume добавлен в $cf (бэкап в $BACKUP_DIR)"
+    ok "Volume добавлен в сервис $svc (бэкап в $BACKUP_DIR)"
     if confirm "Перезапустить remnanode?"; then
       (cd "$COMPOSE_DIR" && docker compose down && docker compose up -d) \
         && ok "remnanode перезапущен" || warn "перезапуск не удался"
