@@ -3,7 +3,7 @@
 # remnaundersettings — надстройка над install_remnawave.sh (eGamesAPI)
 # для нод Remnawave на Xray-core.
 #
-# Версия 3.3.0
+# Версия 3.4.0
 #
 #
 # НАЗНАЧЕНИЕ
@@ -49,6 +49,13 @@
 #
 #   Откат            Возврат профиля из бэкапа одной командой.
 #
+#   Обновление       Сверяет свою версию со строкой VERSION в репозитории
+#                    ShellGross/Remna-settings. Результат кешируется на
+#                    шесть часов, чтобы запуск меню не ждал сеть каждый
+#                    раз. Перед заменой файл проверяется на синтаксис,
+#                    старая версия уходит в бэкап. Автопроверка при
+#                    запуске включается и выключается в пункте меню.
+#
 #
 # ЗАПУСК
 #
@@ -59,6 +66,7 @@
 #     srus --all -y        неинтерактивный прогон
 #     srus --dry-run       показать намерения, ничего не меняя
 #     srus --rollback      откатить профиль
+#     srus --update        обновить скрипт из репозитория
 #     srus --help          все флаги
 #
 #
@@ -77,7 +85,7 @@
 #
 set -uo pipefail
 
-VERSION="3.3.0"
+VERSION="3.4.0"
 SELF_NAME="remnaundersettings.sh"
 SELF_PATH="/usr/local/bin/$SELF_NAME"
 SHORTCUT="/usr/local/bin/srus"
@@ -88,6 +96,11 @@ SYSCTL_CONF="/etc/sysctl.d/99-xray-tuning.conf"
 COMPOSE_DIR="/opt/remnanode"
 CONTAINER_CERT_DIR="/etc/ssl/node"
 CERT_STAMP="/var/lib/remna-node-kit/cert.stamp"
+STATE_DIR="/var/lib/remna-node-kit"
+UPDATE_STATE="$STATE_DIR/update.state"
+RAW_BASE="https://raw.githubusercontent.com/ShellGross/Remna-settings/main"
+REMOTE_FILE="$RAW_BASE/remnaundersettings.sh"
+UPDATE_TTL=21600
 
 
 if locale -a 2>/dev/null | grep -qiE '^C\.utf-?8$'; then export LC_ALL=C.UTF-8
@@ -163,6 +176,7 @@ PROFILE_NAME=""; NODE_NAME=""; SQUAD_NAME=""; HOST_REMARK=""
 TUNE_PROFILE=""; API_SCOPE=""; CERT_DIR=""
 XHTTP_MODE=""; XHTTP_ALPN=""; PATH_STYLE=""; POST_BYTES=""; ROUTE_ONLY=""
 LAST_PROFILE_UUID=""; ALL_INBOUNDS=""
+AUTO_UPDATE_CHECK=1; UPDATE_AVAILABLE=""; REMOTE_VERSION=""
 DRY_RUN=0; ASSUME_YES=0; SKIP_VALIDATE=0; EXPERT=0; NO_INSTALL=0; ACTIONS=()
 
 DEFAULT_PORT="8445"
@@ -257,6 +271,7 @@ POST_BYTES="$POST_BYTES"
 ROUTE_ONLY="$ROUTE_ONLY"
 HOST_REMARK="$HOST_REMARK"
 LAST_PROFILE_UUID="$LAST_PROFILE_UUID"
+AUTO_UPDATE_CHECK="$AUTO_UPDATE_CHECK"
 EOF
   chmod 600 "$CONF"
 }
@@ -1414,6 +1429,163 @@ summary() {
   printf '    %sлог: %s%s\n\n' "$C_GR" "$LOG" "$C_N"
 }
 
+version_gt() {
+  [[ "$1" != "$2" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" == "$1" ]]
+}
+
+fetch_remote_version() {
+  curl -fsSL --max-time 8 "$REMOTE_FILE" 2>/dev/null \
+    | grep -m1 -oP '^VERSION="\K[0-9]+(\.[0-9]+)*'
+}
+
+check_update() {
+  local force="${1:-}" now ts ver
+  now=$(date +%s)
+
+  if [[ -z "$force" && -f "$UPDATE_STATE" ]]; then
+    IFS='|' read -r ts ver <"$UPDATE_STATE" 2>/dev/null
+    if [[ "${ts:-}" =~ ^[0-9]+$ ]] && (( now - ts < UPDATE_TTL )); then
+      REMOTE_VERSION="${ver:-}"
+      [[ -n "$REMOTE_VERSION" ]] && version_gt "$REMOTE_VERSION" "$VERSION" \
+        && UPDATE_AVAILABLE="$REMOTE_VERSION" || UPDATE_AVAILABLE=""
+      return 0
+    fi
+  fi
+
+  ver=$(fetch_remote_version)
+  [[ -z "$ver" ]] && { REMOTE_VERSION=""; return 1; }
+
+  REMOTE_VERSION="$ver"
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  printf '%s|%s\n' "$now" "$ver" >"$UPDATE_STATE" 2>/dev/null
+  version_gt "$ver" "$VERSION" && UPDATE_AVAILABLE="$ver" || UPDATE_AVAILABLE=""
+  return 0
+}
+
+do_selfupdate() {
+  local tmp newver
+  [[ -f "$SELF_PATH" ]] || { err "Скрипт не установлен в $SELF_PATH — обнови вручную"; return 1; }
+
+  tmp=$(mktemp "${SELF_PATH}.XXXXXX" 2>/dev/null) || { err "Нет прав на запись в $(dirname "$SELF_PATH")"; return 1; }
+
+  log "Качаю новую версию…"
+  if ! curl -fsSL --max-time 60 "$REMOTE_FILE" -o "$tmp"; then
+    err "Не смог скачать $REMOTE_FILE"; rm -f "$tmp"; return 1
+  fi
+
+  if ! bash -n "$tmp" 2>/dev/null; then
+    err "Скачанный файл не проходит проверку синтаксиса — обновление отменено"
+    rm -f "$tmp"; return 1
+  fi
+  if ! grep -q 'remnaundersettings' "$tmp"; then
+    err "Файл не похож на этот скрипт — обновление отменено"
+    rm -f "$tmp"; return 1
+  fi
+
+  newver=$(grep -m1 -oP '^VERSION="\K[^"]+' "$tmp")
+  [[ -z "$newver" ]] && { err "В файле нет строки VERSION"; rm -f "$tmp"; return 1; }
+
+  mkdir -p "$BACKUP_DIR"
+  cp -a "$SELF_PATH" "$BACKUP_DIR/remnaundersettings-$VERSION-$(date +%Y%m%d-%H%M%S).sh" 2>/dev/null
+
+  chmod 755 "$tmp"
+  if ! mv -f "$tmp" "$SELF_PATH"; then
+    err "Не смог заменить $SELF_PATH"; rm -f "$tmp"; return 1
+  fi
+  ln -sfn "$SELF_PATH" "$SHORTCUT" 2>/dev/null
+  rm -f "$UPDATE_STATE"
+
+  ok "Обновлено: $VERSION → $newver"
+  dim "старая версия в $BACKUP_DIR"
+  return 0
+}
+
+do_update_menu() {
+  while :; do
+    clear 2>/dev/null || true
+    echo
+    box_top
+    box_rowc "$(printf '%s%s%s' "$C_BD$C_W" "ОБНОВЛЕНИЕ" "$C_N")" "ОБНОВЛЕНИЕ"
+    box_sep
+    box_rowc "$(printf '%s%s%s%s' "$C_GR" "$(pad "установлено" 14)" "$C_N" "$VERSION")" "$(pad "установлено" 14)$VERSION"
+
+    local rv_c rv_p
+    if [[ -n "$REMOTE_VERSION" ]]; then
+      if [[ -n "$UPDATE_AVAILABLE" ]]; then
+        rv_c="$(printf '%s%s%s%s%s%s' "$C_GR" "$(pad "в репозитории" 14)" "$C_N" "$C_YB" "$REMOTE_VERSION" "$C_N")"
+        rv_p="$(pad "в репозитории" 14)$REMOTE_VERSION"
+      else
+        rv_c="$(printf '%s%s%s%s  %sсвежая%s' "$C_GR" "$(pad "в репозитории" 14)" "$C_N" "$REMOTE_VERSION" "$C_G" "$C_N")"
+        rv_p="$(pad "в репозитории" 14)$REMOTE_VERSION  свежая"
+      fi
+    else
+      rv_c="$(printf '%s%s%sне проверялось' "$C_GR" "$(pad "в репозитории" 14)" "$C_N")"
+      rv_p="$(pad "в репозитории" 14)не проверялось"
+    fi
+    box_rowc "$rv_c" "$rv_p"
+    box_bot
+
+    local auto_txt
+    if (( AUTO_UPDATE_CHECK )); then auto_txt="включена → выключить"; else auto_txt="выключена → включить"; fi
+
+    section "ДЕЙСТВИЯ"
+    item "1" "Проверить"       "запросить репозиторий"
+    if [[ -n "$UPDATE_AVAILABLE" ]]; then
+      item "2" "Обновить"      "до $UPDATE_AVAILABLE"
+    else
+      item "2" "Обновить"      "принудительно"
+    fi
+    item "3" "Автопроверка"    "$auto_txt"
+    item "0" "Назад"           ""
+    echo
+
+    local c; c=$(ask "  выбор" "")
+    echo
+    case "$c" in
+      1)
+        log "Проверяю репозиторий…"
+        if check_update force; then
+          if [[ -n "$UPDATE_AVAILABLE" ]]; then
+            ok "Есть новая версия: $UPDATE_AVAILABLE (у тебя $VERSION)"
+          else
+            ok "Установлена актуальная версия $VERSION"
+          fi
+        else
+          err "Репозиторий недоступен — проверь сеть"
+        fi
+        ;;
+      2)
+        if [[ -z "$UPDATE_AVAILABLE" ]]; then
+          warn "Новее версии не найдено."
+          confirm "Всё равно перекачать из репозитория?" || { echo; read -r -p "  Enter " _ </dev/tty; continue; }
+        else
+          hr
+          printf '  %s%s%s → %s%s%s\n' "$C_GR" "$VERSION" "$C_N" "$C_GB" "$UPDATE_AVAILABLE" "$C_N"
+          hr
+          confirm "Обновить сейчас?" || { echo; read -r -p "  Enter " _ </dev/tty; continue; }
+        fi
+        if do_selfupdate; then
+          echo
+          if confirm "Перезапустить обновлённый скрипт?"; then
+            exec "$SELF_PATH"
+          fi
+          return 0
+        fi
+        ;;
+      3)
+        if (( AUTO_UPDATE_CHECK )); then AUTO_UPDATE_CHECK=0; ok "Автопроверка выключена"
+        else AUTO_UPDATE_CHECK=1; ok "Автопроверка включена"; fi
+        save_conf
+        ;;
+      0) return 0 ;;
+      *) warn "Не понял команду «$c»" ;;
+    esac
+    echo
+    read -r -p "  ${C_GR}Enter${C_N} " _ </dev/tty
+  done
+}
+
 menu() {
   while :; do
     clear 2>/dev/null || true
@@ -1447,6 +1619,12 @@ menu() {
     else ck_c="$(printf '%s○%s гейт' "$C_GR" "$C_N")"; ck_p="○ гейт"; fi
     box_rowc "${pan_c}   ${ck_c}" "${pan_p}   ${ck_p}"
 
+    if [[ -n "$UPDATE_AVAILABLE" ]]; then
+      box_sep
+      box_rowc "$(printf '%s↑ версия %s — обновить в пункте u%s' "$C_YB" "$UPDATE_AVAILABLE" "$C_N")" \
+               "↑ версия $UPDATE_AVAILABLE — обновить в пункте u"
+    fi
+
     box_bot
 
     section "ХОСТ"
@@ -1466,6 +1644,11 @@ menu() {
     item "6" "Всё подряд"      "1 → 2 → 3 → 4"
     item "9" "Параметры"       "домен · токен"
     item "p" "Новый path"      "перегенерация"
+    if [[ -n "$UPDATE_AVAILABLE" ]]; then
+      item "u" "Обновления"    "доступна $UPDATE_AVAILABLE"
+    else
+      item "u" "Обновления"    "проверка · автопроверка"
+    fi
     item "0" "Выход"           ""
     echo
 
@@ -1482,6 +1665,7 @@ menu() {
       8) do_rollback ;;
       9) setup_wizard ;;
       p|P) XHTTP_PATH=""; prompt_path; save_conf ;;
+      u|U) do_update_menu; continue ;;
       0) printf '  %sПока.%s\n\n' "$C_GR" "$C_N"; exit 0 ;;
       *) warn "Не понял команду «$c»" ;;
     esac
@@ -1516,6 +1700,8 @@ remnaundersettings $VERSION — надстройка над install_remnawave.sh
   --print         собрать инбаунд и вывести JSON
   --postflight    проверить живость: логи, порт, TLS, conntrack
   --rollback      откатить профиль из бэкапа
+  --check-update  сверить версию с репозиторием
+  --update        обновить скрипт, если в репозитории новее
   --all           tune + firewall + certs + xhttp
 
 Параметры:
@@ -1582,6 +1768,8 @@ while [[ $# -gt 0 ]]; do
     --expert) EXPERT=1 ;;
     --skip-validate) SKIP_VALIDATE=1 ;;
     --no-install) NO_INSTALL=1 ;;
+    --update) ACTIONS+=(update) ;;
+    --check-update) ACTIONS+=(checkupdate) ;;
     --dry-run) DRY_RUN=1 ;;
     -y|--yes) ASSUME_YES=1 ;;
     -h|--help) usage; exit 0 ;;
@@ -1631,6 +1819,7 @@ _tolog "=== запуск v$VERSION: ${ACTIONS[*]:-меню} ==="
 
 ensure_deps
 if (( ${#ACTIONS[@]} == 0 )); then
+  (( AUTO_UPDATE_CHECK )) && check_update >/dev/null 2>&1
   menu
 else
   for a in "${ACTIONS[@]}"; do
@@ -1642,6 +1831,16 @@ else
       print) do_xhttp_print ;;
       postflight) do_postflight ;;
       rollback) do_rollback ;;
+      update)
+        check_update force
+        if [[ -n "$UPDATE_AVAILABLE" ]]; then do_selfupdate
+        else ok "Установлена актуальная версия $VERSION"; fi ;;
+      checkupdate)
+        if check_update force; then
+          [[ -n "$UPDATE_AVAILABLE" ]] \
+            && warn "Доступна версия $UPDATE_AVAILABLE (установлена $VERSION)" \
+            || ok "Установлена актуальная версия $VERSION"
+        else err "Репозиторий недоступен"; fi ;;
     esac
   done
   save_conf
