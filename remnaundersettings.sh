@@ -3,7 +3,7 @@
 # remnaundersettings — надстройка над install_remnawave.sh (eGamesAPI)
 # для нод Remnawave на Xray-core.
 #
-# Версия 3.5.0
+# Версия 3.5.1
 #
 #
 # НАЗНАЧЕНИЕ
@@ -85,7 +85,7 @@
 #
 set -uo pipefail
 
-VERSION="3.5.0"
+VERSION="3.5.1"
 SELF_NAME="remnaundersettings.sh"
 SELF_PATH="/usr/local/bin/$SELF_NAME"
 SHORTCUT="/usr/local/bin/srus"
@@ -607,6 +607,30 @@ resolve_certs() {
   return 0
 }
 
+cert_visible_in_container() {
+  have_node_container || return 0
+  [[ -n "$CERT_IN_CONTAINER" ]] || return 1
+  docker exec "$(find_node_container)" test -f "$CERT_IN_CONTAINER" 2>/dev/null
+}
+
+ensure_cert_mounted() {
+  cert_visible_in_container && return 0
+  hr
+  err "Сертификат на хосте есть, но контейнер его не видит:"
+  dim "$CERT_IN_CONTAINER"
+  dim "Каталог не смонтирован в remnanode — Xray не сможет поднять инбаунд."
+  hr
+  confirm "Смонтировать и перезапустить ноду сейчас?" || return 1
+  do_certs || return 1
+  sleep 2
+  if cert_visible_in_container; then
+    ok "Теперь сертификат виден контейнеру"
+    return 0
+  fi
+  err "Сертификат всё ещё не виден. Проверь volumes в $COMPOSE_DIR/docker-compose.yml"
+  return 1
+}
+
 do_certs() {
   need_root
   resolve_certs || return 1
@@ -1104,6 +1128,7 @@ do_xhttp_api() {
   fi
 
   [[ -n "$CERT_IN_CONTAINER" ]] || resolve_certs || return 1
+  ensure_cert_mounted || { warn "Без смонтированного сертификата инбаунд не поднимется — отменяю."; return 1; }
 
   local existing
   existing=$(jq -r --arg t "$INBOUND_TAG" \
