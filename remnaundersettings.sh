@@ -1,20 +1,79 @@
 #!/usr/bin/env bash
 #
-# remnaundersettings.sh — надстройка над install_remnawave.sh (eGamesAPI)
+# remnaundersettings — надстройка над install_remnawave.sh (eGamesAPI)
+# для нод Remnawave на Xray-core.
 #
-# При первом запуске кладёт себя в /usr/local/bin и создаёт ярлык `srus`,
-# после чего вызывается из любого каталога командой srus.
+# Версия 3.3.0
 #
-# Запускать ПОСЛЕ того, как скрипт eGames поставил ноду.
 #
-#   1. sysctl-тюнинг под автоопределённый профиль железа (+ RPS/RFS, conntrack)
-#   2. UFW: открыть порт xHTTP, спрятать NODE_PORT за IP панели
-#   3. Найти сертификаты SelfSteal, смонтировать в remnanode, повесить хук на продление
-#   4. Собрать xHTTP+TLS инбаунд с рандомным path, проверить через xray -test, залить в панель
-#   5. Постфлайт: логи ядра, порт, TLS-рукопожатие снаружи
-#   6. Откат профиля из бэкапа одной командой
+# НАЗНАЧЕНИЕ
 #
-# Без аргументов — интерактивное меню. С флагами — неинтерактивный прогон.
+#   Скрипт eGames ставит ноду в базовой конфигурации. Всё дальнейшее —
+#   тюнинг ядра, открытие портов, монтирование сертификатов, добавление
+#   xHTTP-инбаунда — обычно делается руками на каждой ноде отдельно.
+#   Этот скрипт проходит те же шаги за один прогон и проверяет результат
+#   вместо того, чтобы доверять кодам ответа панели.
+#
+#   Запускать ПОСЛЕ того, как eGames закончил и нода видна в панели.
+#
+#
+# ЧТО ДЕЛАЕТ
+#
+#   Тюнинг хоста     sysctl под автоопределённый профиль железа:
+#                      base — 1 сильное ядро / 2 GB
+#                      dual — 2 слабых ядра / 2 GB, добавляет RPS/RFS
+#                      tiny — 1 ядро / 1 GB, буферы и conntrack урезаны
+#                    BBR не трогает, если его уже включил eGames.
+#
+#   Фаервол          Открывает порт xHTTP. NODE_PORT прячет за IP панели,
+#                    определяя его по активному соединению, и снимает
+#                    сквозной allow, если тот был открыт всем.
+#
+#   Сертификаты      Ищет серты SelfSteal в letsencrypt, каталогах
+#                    remnanode и Caddy. Монтирует в контейнер, причём
+#                    /etc/letsencrypt целиком — иначе симлинки в archive
+#                    окажутся битыми и Xray не стартует. Ставит хук на
+#                    продление и суточный таймер по mtime для acme.sh
+#                    и Caddy, где хука certbot нет.
+#
+#   Инбаунд          Собирает VLESS + xHTTP + TLS с рандомным path,
+#                    проверяет через xray -test внутри контейнера и
+#                    заливает в Config Profile по API. Профиль бэкапится
+#                    до патча. Тег проверяется на уникальность по всем
+#                    профилям панели: дубликат увёл бы резолв к чужому
+#                    инбаунду и затёр соседнюю ноду.
+#
+#   Постфлайт        Логи ядра, реальный список инбаундов на ноде,
+#                    слушается ли порт, TLS-рукопожатие снаружи с нужным
+#                    SNI, заполненность conntrack.
+#
+#   Откат            Возврат профиля из бэкапа одной командой.
+#
+#
+# ЗАПУСК
+#
+#   При первом запуске кладёт себя в /usr/local/bin и создаёт ярлык
+#   srus, после чего вызывается из любого каталога.
+#
+#     srus                 интерактивное меню
+#     srus --all -y        неинтерактивный прогон
+#     srus --dry-run       показать намерения, ничего не меняя
+#     srus --rollback      откатить профиль
+#     srus --help          все флаги
+#
+#
+# ТРЕБОВАНИЯ
+#
+#   root, Ubuntu 22.04+, установленная нода Remnawave.
+#   jq, curl и openssl доставляются автоматически.
+#
+#
+# ФАЙЛЫ
+#
+#   /etc/remna-node-kit.conf           параметры и токен, режим 600
+#   /var/log/remna-node-kit.log        лог действий
+#   /var/backups/remna-node-kit/       бэкапы профилей и docker-compose
+#   /etc/sysctl.d/99-xray-tuning.conf  тюнинг ядра
 #
 set -uo pipefail
 
@@ -30,10 +89,7 @@ COMPOSE_DIR="/opt/remnanode"
 CONTAINER_CERT_DIR="/etc/ssl/node"
 CERT_STAMP="/var/lib/remna-node-kit/cert.stamp"
 
-# ---------------------------------------------------------------- вывод ----
 
-# ${#строка} считает байты, если локаль не UTF-8 — кириллица ломает вёрстку.
-# C.UTF-8 есть в glibc на Ubuntu 22.04+, для остальных ниже деградация.
 if locale -a 2>/dev/null | grep -qiE '^C\.utf-?8$'; then export LC_ALL=C.UTF-8
 elif locale -a 2>/dev/null | grep -qiE '^en_US\.utf-?8$'; then export LC_ALL=en_US.UTF-8
 fi
@@ -52,8 +108,6 @@ fi
 
 BOX_W=46
 
-# Ширина строки в символах. printf %-Ns выравнивает по байтам, поэтому
-# добиваем пробелами сами — пробел всегда однобайтовый.
 pad() {
   local s="$1" w="$2" n
   if (( UTF_OK )); then n=$(( w - ${#s} )); else n=$(( w - ${#s} )); fi
@@ -68,8 +122,6 @@ box_bot()  { printf '%s╰%s╯%s\n' "$C_GR" "$(rep '─' $((BOX_W-2)))" "$C_N";
 box_sep()  { printf '%s├%s┤%s\n' "$C_GR" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
 box_row()  { printf '%s│%s %s %s│%s\n' "$C_GR" "$C_N" "$(pad "$1" $((BOX_W-4)))" "$C_GR" "$C_N"; }
 
-# Строка в рамке, где текст уже содержит цветовые коды: ширину считаем
-# по «чистому» варианту, переданному вторым аргументом.
 box_rowc() {
   local colored="$1" plain="$2"
   local n=$(( BOX_W - 4 - ${#plain} ))
@@ -79,21 +131,20 @@ box_rowc() {
 
 section() { printf '\n  %s%s%s\n' "$C_BD$C_BL" "$1" "$C_N"; }
 
-item() {  # item <клавиша> <название> <подсказка>
+item() {
   printf '   %s%s%s  %s%s%s  %s%s%s\n' \
     "$C_BB" "$(pad "$1" 2)" "$C_N" \
     "$C_W" "$(pad "$2" 16)" "$C_N" \
     "$C_GR" "$3" "$C_N"
 }
 
-dot() {  # dot <есть?> <текст> — зелёная точка или серая
+dot() {
   if [[ -n "$2" && "$2" != "—" ]]; then printf '%s●%s %s' "$C_G" "$C_N" "$2"
   else printf '%s○%s %s' "$C_GR" "$C_N" "${3:-не задано}"; fi
 }
 
 _tolog() {
   [[ -w "$(dirname "$LOG")" ]] || return 0
-  # в лог без цветовых кодов, иначе grep по нему бесполезен
   printf '%s %s\n' "$(date '+%F %T')" "$(sed 's/\x1b\[[0-9;]*m//g' <<<"$1")" >>"$LOG" 2>/dev/null || true
 }
 
@@ -105,7 +156,6 @@ die()  { err "$*"; exit 1; }
 dim()  { printf '    %s%s%s\n' "$C_GR" "$*" "$C_N"; }
 hr()   { printf '  %s%s%s\n' "$C_GR" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
 
-# ------------------------------------------------------------ параметры ----
 
 DOMAIN=""; XHTTP_PORT=""; XHTTP_PATH=""; INBOUND_TAG=""
 PANEL_URL=""; PANEL_TOKEN=""; PANEL_COOKIE=""; PANEL_API_KEY=""; PANEL_IP=""
@@ -120,7 +170,6 @@ DEFAULT_PORT="8445"
 CERT_HOST_DIR=""; CERT_FILE=""; KEY_FILE=""; MOUNT_SRC=""; MOUNT_DST=""
 CERT_IN_CONTAINER=""; KEY_IN_CONTAINER=""
 
-# ------------------------------------------------------------- утилиты -----
 
 need_root() { [[ $EUID -eq 0 ]] || die "Нужен root."; }
 
@@ -139,8 +188,6 @@ ask() {
   fi
 }
 
-# ask_valid <prompt> <default> <validator-fn> <подсказка при ошибке>
-# Спрашивает, пока не введут корректное. Значение — в stdout, всё остальное — в stderr.
 ask_valid() {
   local prompt="$1" default="$2" vfn="$3" hint="$4" v
   while :; do
@@ -150,7 +197,6 @@ ask_valid() {
   done
 }
 
-# choose <prompt> <default-номер> <метка1> <значение1> <метка2> <значение2> …
 choose() {
   local prompt="$1" def="$2"; shift 2
   local -a labels=() values=()
@@ -221,7 +267,6 @@ cpu_model() { awk -F: '/model name/{gsub(/^ +/,"",$2); print $2; exit}' /proc/cp
 swap_mb()   { awk '/SwapTotal/{printf "%d", $2/1024}' /proc/meminfo; }
 
 NODE_CT=""
-# Имя контейнера не всегда remnanode — ищем по образу
 find_node_container() {
   [[ -n "$NODE_CT" ]] && { printf '%s' "$NODE_CT"; return 0; }
   local c
@@ -233,17 +278,6 @@ find_node_container() {
 }
 have_node_container() { find_node_container >/dev/null 2>&1; }
 
-# ======================================================================
-#  1. ТЮНИНГ ХОСТА
-# ======================================================================
-#
-#  Три профиля под реальное железо нод:
-#
-#   base  — 1 сильное ядро / 2 GB   (типа Ryzen 9950X, 1 vCPU)
-#   dual  — 2 слабых ядра / 2 GB    (+ RPS/RFS, иначе одно ядро упирается в softirq)
-#   tiny  — 1 ядро / 1 GB           (буферы вдвое меньше, conntrack урезан, своп критичен)
-#
-# ======================================================================
 
 detect_tune_profile() {
   local ram cores; ram=$(ram_mb); cores=$(cpu_cores)
@@ -303,12 +337,11 @@ do_tune() {
   touch "$SYSCTL_CONF"
   cp -a "$SYSCTL_CONF" "$SYSCTL_CONF.bak.$(date +%s)" 2>/dev/null || true
 
-  # ---- общее для всех профилей: rate новых соединений, TIME_WAIT, keepalive
   set_kv net.core.somaxconn 65535
   set_kv net.core.netdev_max_backlog 16384
   set_kv net.ipv4.tcp_max_syn_backlog 8192
   set_kv net.ipv4.tcp_syncookies 1
-  set_kv net.ipv4.tcp_timestamps 1          # без него tcp_tw_reuse молча не работает
+  set_kv net.ipv4.tcp_timestamps 1
   set_kv net.ipv4.tcp_tw_reuse 1
   set_kv net.ipv4.tcp_fin_timeout 15
   set_kv net.ipv4.tcp_keepalive_time 300
@@ -324,7 +357,6 @@ do_tune() {
   set_kv fs.file-max 1048576
   set_kv fs.nr_open 1048576
 
-  # ---- буферы и conntrack по профилю
   case "$prof" in
     tiny)
       set_kv net.core.rmem_max 8388608
@@ -354,11 +386,9 @@ do_tune() {
   set_kv net.netfilter.nf_conntrack_tcp_timeout_established 3600
   set_kv net.netfilter.nf_conntrack_tcp_timeout_time_wait 30
 
-  # conntrack сам не грузится — после ребута sysctl тихо проглотит несуществующие ключи
   echo "nf_conntrack" >/etc/modules-load.d/nf_conntrack.conf
   modprobe nf_conntrack 2>/dev/null || warn "modprobe nf_conntrack не прошёл"
 
-  # BBR: eGames его уже ставит. Трогаем, только если там что-то другое.
   local cc; cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
   if [[ "$cc" != "bbr" ]]; then
     warn "congestion control = '$cc', ставлю bbr"
@@ -372,7 +402,6 @@ do_tune() {
 
   [[ "$prof" == "dual" ]] && install_rps_unit
 
-  # своп на маленьких нодах — без него OOM-killer выберет именно Xray
   if [[ "$prof" == "tiny" ]] && (( $(swap_mb) < 256 )); then
     hr
     warn "Свопа нет, а RAM $(ram_mb) MB."
@@ -424,9 +453,6 @@ EOF
     && ok "RPS/RFS включён (маска $mask, ядер $cores)" || warn "xray-rps.service не поднялся"
 }
 
-# ======================================================================
-#  2. ФАЕРВОЛ
-# ======================================================================
 
 node_port() {
   local p=""
@@ -435,7 +461,6 @@ node_port() {
   echo "${p:-2222}"
 }
 
-# Панель уже стучится на NODE_PORT — её IP видно в установленных соединениях
 detect_panel_ip() {
   local np="$1" ip=""
   command -v ss >/dev/null 2>&1 || return 1
@@ -477,7 +502,6 @@ do_firewall() {
     ufw allow from "$PANEL_IP" to any port "$np" proto tcp comment 'remnawave panel' >/dev/null 2>&1 \
       && ok "NODE_PORT $np открыт только для $PANEL_IP" || warn "правило для NODE_PORT не прошло"
 
-    # снять сквозной allow, если eGames открыл порт всем
     local guard=0
     while (( guard++ < 10 )) && ufw status numbered | grep -qE "\[[ 0-9]+\] ${np}(/tcp)?[[:space:]]+ALLOW IN[[:space:]]+Anywhere"; do
       local n
@@ -494,9 +518,6 @@ do_firewall() {
   hr; ufw status verbose | head -30
 }
 
-# ======================================================================
-#  3. СЕРТИФИКАТЫ
-# ======================================================================
 
 find_certs_all() {
   local d="$1" base found
@@ -510,7 +531,6 @@ find_certs_all() {
     [[ -f "$c/fullchain.pem" && -f "$c/privkey.pem" ]] && printf '%s|fullchain.pem|privkey.pem\n' "$c"
   done
 
-  # Caddy кладёт .crt/.key вместо fullchain/privkey
   while IFS= read -r found; do
     [[ -n "$found" && -f "${found%.crt}.key" ]] && \
       printf '%s|%s|%s\n' "$(dirname "$found")" "$(basename "$found")" "$(basename "${found%.crt}.key")"
@@ -537,7 +557,6 @@ resolve_certs() {
     elif (( ${#found[@]} == 1 )); then
       res="${found[0]}"
     else
-      # несколько кандидатов — например letsencrypt и caddy одновременно
       local -a args=()
       for f in "${found[@]}"; do
         local dirp="${f%%|*}" rest="${f#*|}" cf="${rest%%|*}" exp
@@ -556,8 +575,6 @@ resolve_certs() {
   ok "Сертификат: $CERT_HOST_DIR/$CERT_FILE"
   [[ -n "$exp" ]] && dim "  действителен до: $exp"
 
-  # /etc/letsencrypt/live — симлинки в ../../archive. Монтируем корень целиком,
-  # иначе внутри контейнера окажутся битые ссылки и Xray не стартует.
   if [[ "$CERT_HOST_DIR" == /etc/letsencrypt/* ]]; then
     MOUNT_SRC="/etc/letsencrypt"; MOUNT_DST="/etc/letsencrypt"
     CERT_IN_CONTAINER="$CERT_HOST_DIR/$CERT_FILE"
@@ -616,8 +633,6 @@ do_certs() {
   install_cert_hook
 }
 
-# После продления серта файлы на диске новые, а Xray держит в памяти старый —
-# до рестарта клиенты получают протухший сертификат.
 install_cert_hook() {
   (( DRY_RUN )) && { dim "dry-run: пропускаю установку хука продления"; return 0; }
 
@@ -639,7 +654,6 @@ EOF
   chmod +x /usr/local/sbin/remnanode-cert-reload.sh
   touch "$CERT_STAMP"
 
-  # certbot: хук после успешного продления
   if [[ -d /etc/letsencrypt ]]; then
     mkdir -p /etc/letsencrypt/renewal-hooks/deploy
     ln -sf /usr/local/sbin/remnanode-cert-reload.sh \
@@ -647,7 +661,6 @@ EOF
     ok "Хук certbot: /etc/letsencrypt/renewal-hooks/deploy/remnanode-reload.sh"
   fi
 
-  # На случай acme.sh / Caddy / ручного обновления — суточный таймер по mtime
   cat >/etc/systemd/system/remnanode-cert-reload.service <<'EOF'
 [Unit]
 Description=Restart remnanode when TLS certificate changes
@@ -673,9 +686,6 @@ EOF
     && ok "Суточный таймер проверки серта включён" || warn "таймер не поднялся"
 }
 
-# ======================================================================
-#  4. СБОРКА ИНБАУНДА
-# ======================================================================
 
 buffer_size() { local r; r=$(ram_mb); (( r < 1536 )) && echo 256 || echo 512; }
 post_bytes()  { local r; r=$(ram_mb); (( r < 1536 )) && echo 65536 || echo 131072; }
@@ -685,14 +695,12 @@ port_busy() {
   ss -lntH "sport = :$1" 2>/dev/null | grep -q .
 }
 
-# ---------------------------------------------------- валидаторы ----------
 
 validate_tag()  { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{1,31}$ ]]; }
 validate_path() { [[ "$1" =~ ^/[A-Za-z0-9._~!$\&*+,\;=:@%/-]{1,120}$ ]]; }
 validate_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
 validate_domain(){ [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; }
 
-# de.example.com + 8445 -> VLESS-XHTTP-DE-8445
 derive_tag() {
   local d="$1" port="$2" label
   label=$(echo "$d" | cut -d. -f1 | tr '[:lower:]' '[:upper:]' | tr -cd 'A-Z0-9-')
@@ -706,10 +714,7 @@ gen_path_mimic() {
   printf '%s/%s' "${p[$((RANDOM % ${#p[@]}))]}" "$(openssl rand -hex 4)"
 }
 
-# ------------------------------------------- интерактивный выбор ----------
 
-# Тег обязан быть уникальным по всем профилям: иначе резолв tag -> uuid
-# в панели даст не тот инбаунд, а патч затрёт чужую ноду.
 tag_taken_elsewhere() {
   local tag="$1" own_uuid="$2"
   [[ -z "$ALL_INBOUNDS" ]] && return 1
@@ -759,7 +764,6 @@ prompt_port() {
       confirm "Всё равно взять 80?" || continue
     fi
 
-    # столкновение с другим инбаундом в этом же профиле — Xray не забиндится
     if [[ -n "$cfg" ]]; then
       local clash
       clash=$(jq -r --arg t "$INBOUND_TAG" --argjson p "$p" \
@@ -803,7 +807,6 @@ prompt_path() {
 }
 
 prompt_transport() {
-  # значения по умолчанию, если тонкую настройку не запрашивали
   [[ -n "$XHTTP_MODE"  ]] || XHTTP_MODE="auto"
   [[ -n "$XHTTP_ALPN"  ]] || XHTTP_ALPN="h2,http/1.1"
   [[ -n "$POST_BYTES"  ]] || POST_BYTES=$(post_bytes)
@@ -893,7 +896,6 @@ patch_profile_config() {
   ' <<<"$cfg"
 }
 
-# --- валидация до отправки: xray сам скажет, что не так --------------------
 validate_config() {
   local cfg="$1"
 
@@ -904,7 +906,6 @@ validate_config() {
     return 0
   fi
 
-  # Remnawave-снипеты Xray не понимает — их подставляет панель
   if grep -q '"snippet"' <<<"$cfg"; then
     warn "В профиле есть \"snippet\" — Xray его не разберёт, пропускаю валидацию."
     return 0
@@ -933,9 +934,6 @@ validate_config() {
   return 1
 }
 
-# ======================================================================
-#  5. API
-# ======================================================================
 
 api() {
   local method="$1" path="$2" body="${3:-}"
@@ -979,7 +977,7 @@ EOT
   ok "Панель отвечает"
 }
 
-pick() {  # pick <json-array> <label> <value> <prompt> <preselect>
+pick() {
   local arr="$1" lf="$2" vf="$3" prompt="$4" pre="${5:-}"
   local n; n=$(jq 'length' <<<"$arr" 2>/dev/null) || { err "Не массив: $prompt"; return 1; }
   (( n > 0 )) || { err "Список пуст: $prompt"; return 1; }
@@ -1041,11 +1039,9 @@ do_xhttp_api() {
   [[ -n "$DOMAIN" ]] || DOMAIN=$(ask_valid "SelfSteal-домен ноды" "" validate_domain \
       "Похоже на домен: node.example.com")
 
-  # список всех инбаундов панели нужен для проверки уникальности тега
   ALL_INBOUNDS=$(api GET /config-profiles/inbounds 2>/dev/null \
                  | jq '(.response.inbounds // .response)' 2>/dev/null) || ALL_INBOUNDS=""
 
-  # ---- профиль: существующий или новый
   local profiles pu cfg
   profiles=$(api GET /config-profiles | jq '.response.configProfiles // .response')
 
@@ -1077,7 +1073,6 @@ do_xhttp_api() {
   fi
   LAST_PROFILE_UUID="$pu"
 
-  # ---- порт и тег (порядок важен: тег выводится из порта)
   [[ -n "$XHTTP_PORT" ]] || XHTTP_PORT="$DEFAULT_PORT"
   if [[ -z "$INBOUND_TAG" ]] && (( ! ASSUME_YES )); then
     prompt_port "$cfg"
@@ -1092,8 +1087,6 @@ do_xhttp_api() {
 
   [[ -n "$CERT_IN_CONTAINER" ]] || resolve_certs || return 1
 
-  # ---- path: в панели он главнее локального конфига.
-  # Иначе переставил ноду с нуля — path перегенерился, выданные конфиги мертвы.
   local existing
   existing=$(jq -r --arg t "$INBOUND_TAG" \
     '.inbounds[]? | select(.tag==$t) | .streamSettings.xhttpSettings.path // empty' <<<"$cfg")
@@ -1113,12 +1106,10 @@ do_xhttp_api() {
 
   prompt_transport
 
-  # ---- бэкап
   mkdir -p "$BACKUP_DIR"
   local bk="$BACKUP_DIR/profile-${pu}-$(date +%Y%m%d-%H%M%S).json"
   jq . <<<"$cfg" >"$bk"; ok "Бэкап: $bk"
 
-  # ---- патч + валидация
   local inbound newcfg
   inbound=$(build_inbound)
   newcfg=$(patch_profile_config "$cfg" "$inbound") || { err "jq не собрал конфиг."; return 1; }
@@ -1134,8 +1125,6 @@ do_xhttp_api() {
     "$(jq -n --arg u "$pu" --argjson c "$newcfg" '{uuid:$u, config:$c}')" \
     "Патч профиля" >/dev/null || { err "Откат: srus --rollback"; return 1; }
 
-  # Панель может ответить 200 и молча выбросить тело (whitelist в DTO).
-  # Поэтому не верим коду ответа — перечитываем профиль и ищем свой тег.
   if verify_in_profile "$pu" "$INBOUND_TAG"; then
     ok "Инбаунд «$INBOUND_TAG» есть в профиле"
   else
@@ -1148,7 +1137,6 @@ do_xhttp_api() {
   save_conf
   [[ "$API_SCOPE" == "inbound" ]] && { do_postflight; return 0; }
 
-  # ---- uuid инбаунда (панель присваивает его не мгновенно)
   local iu="" try
   for try in 1 2 3; do
     iu=$(api GET /config-profiles/inbounds 2>/dev/null \
@@ -1159,7 +1147,6 @@ do_xhttp_api() {
   [[ -z "$iu" ]] && { err "uuid инбаунда не нашёлся — Host и ноду настрой в панели руками"; do_postflight; return 0; }
   ok "Inbound uuid: $iu"
 
-  # ---- Host
   local host_body
   [[ -n "$HOST_REMARK" ]] || HOST_REMARK=$(ask "Название Host в панели" "${DOMAIN} xHTTP ${XHTTP_PORT}")
   host_body=$(jq -n --arg pu "$pu" --arg iu "$iu" --arg d "$DOMAIN" --arg p "$XHTTP_PATH" \
@@ -1176,17 +1163,13 @@ do_xhttp_api() {
 
   [[ "$API_SCOPE" == "host" ]] && { do_postflight; return 0; }
 
-  # ---- включение инбаунда на ноде
   enable_on_node "$pu" "$iu" || true
 
-  # ---- сквад (без него инбаунд не попадёт в подписки)
   add_to_squad "$iu" || true
 
   do_postflight
 }
 
-# Пишущий вызов с показом ошибки. Раньше ответ уходил в /dev/null,
-# и провалившийся PATCH выглядел как успешный.
 api_write() {
   local method="$1" path="$2" body="$3" label="$4" out rc=0
   out=$(api "$method" "$path" "$body" 2>&1) || rc=$?
@@ -1225,8 +1208,6 @@ enable_on_node() {
   cur=$(jq -r '[.configProfile.activeInbounds[]? | (.uuid // .)] | @json' <<<"$node")
   [[ -z "$cur" || "$cur" == "null" ]] && cur="[]"
 
-  # Профиль ноды меняется целиком: если он был другой, старые инбаунды
-  # к новому профилю не относятся и в список идти не должны.
   local oldpu
   oldpu=$(jq -r '.configProfile.activeConfigProfileUuid // empty' <<<"$node")
   if [[ -n "$oldpu" && "$oldpu" != "$pu" ]]; then
@@ -1249,7 +1230,6 @@ enable_on_node() {
     return 1
   fi
 
-  # Пуш конфига на ноду. Без него Xray продолжит крутить старую версию.
   api POST "/nodes/$nu/actions/restart" '{}' >/dev/null 2>&1 \
     && ok "Нода перезапущена" \
     || dim "Рестарт ноды не дёрнулся — панель обычно пушит конфиг сама в течение минуты"
@@ -1298,15 +1278,11 @@ do_xhttp_print() {
   summary
 }
 
-# ======================================================================
-#  6. ПОСТФЛАЙТ
-# ======================================================================
 
 do_postflight() {
   hr; log "Постфлайт"
   local fails=0
 
-  # --- ядро поднялось?
   if have_node_container; then
     sleep 3
     local xl ct; ct=$(find_node_container)
@@ -1322,7 +1298,6 @@ do_postflight() {
     warn "Контейнер remnanode не запущен"; (( fails++ ))
   fi
 
-  # --- инбаунд реально доехал до ноды?
   if have_node_container && [[ -n "$INBOUND_TAG" ]]; then
     local ct2 live; ct2=$(find_node_container)
     live=$(docker exec "$ct2" sh -c 'cat $(ps -o args= -C xray 2>/dev/null | grep -oE "\-c[= ][^ ]+" | head -1 | sed "s/^-c[= ]//") 2>/dev/null' 2>/dev/null \
@@ -1334,7 +1309,6 @@ do_postflight() {
     fi
   fi
 
-  # --- порт слушается?
   if port_busy "$XHTTP_PORT"; then
     ok "Порт $XHTTP_PORT слушается"
   else
@@ -1342,7 +1316,6 @@ do_postflight() {
     dim "Панель могла ещё не запушить конфиг — подожди 10-15 сек и повтори --postflight"
   fi
 
-  # --- TLS снаружи с правильным SNI
   if [[ -n "$DOMAIN" ]]; then
     local tls
     tls=$(echo | timeout 10 openssl s_client -connect "${DOMAIN}:${XHTTP_PORT}" \
@@ -1360,7 +1333,6 @@ do_postflight() {
     fi
   fi
 
-  # --- conntrack не забит
   local cc cm
   cc=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)
   cm=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
@@ -1376,9 +1348,6 @@ do_postflight() {
   return $(( fails > 0 ))
 }
 
-# ======================================================================
-#  7. ОТКАТ
-# ======================================================================
 
 do_rollback() {
   ensure_deps
@@ -1421,7 +1390,6 @@ do_rollback() {
   sleep 3; do_postflight
 }
 
-# ======================================================================
 
 summary() {
   local rows=(
@@ -1439,7 +1407,6 @@ summary() {
   local r k v
   for r in "${rows[@]}"; do
     k="${r%%|*}"; v="${r#*|}"
-    # длинный путь к серту обрезаем с головы, хвост информативнее
     if (( ${#v} > BOX_W-16 )); then v="…${v: -$((BOX_W-17))}"; fi
     box_rowc "$(printf '%s%s%s%s' "$C_GR" "$(pad "$k" 12)" "$C_N" "$v")" "$(pad "$k" 12)$v"
   done
@@ -1623,11 +1590,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-# ------------------------------------------------------------- запуск ----
 
-# Кладёт себя в /usr/local/bin под родным именем и вешает короткий ярлык srus.
-# Симлинк, а не alias: работает в любой оболочке, под sudo и в cron,
-# и не требует перечитывать ~/.bashrc.
 self_install() {
   (( NO_INSTALL )) && return 0
   local src
@@ -1635,7 +1598,6 @@ self_install() {
   [[ -f "$src" ]] || return 0
 
   if [[ "$src" != "$SELF_PATH" ]]; then
-    # через временный файл + mv: rename атомарен и не рвёт уже запущенный процесс
     if cp "$src" "$SELF_PATH.tmp" 2>/dev/null && chmod 755 "$SELF_PATH.tmp" 2>/dev/null \
        && mv -f "$SELF_PATH.tmp" "$SELF_PATH" 2>/dev/null; then
       ok "Установлен: $SELF_PATH"
@@ -1648,7 +1610,6 @@ self_install() {
   fi
 
   if [[ -L "$SHORTCUT" ]]; then
-    # ярлык есть — молча освежаем цель на случай переезда
     ln -sfn "$SELF_PATH" "$SHORTCUT" 2>/dev/null
   elif [[ -e "$SHORTCUT" ]]; then
     warn "$SHORTCUT занят посторонним файлом — ярлык не трогаю"
