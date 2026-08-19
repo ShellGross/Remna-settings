@@ -3,7 +3,7 @@
 # remnaundersettings — надстройка над install_remnawave.sh (eGamesAPI)
 # для нод Remnawave на Xray-core.
 #
-# Версия 3.4.0
+# Версия 3.5.0
 #
 #
 # НАЗНАЧЕНИЕ
@@ -85,7 +85,7 @@
 #
 set -uo pipefail
 
-VERSION="3.4.0"
+VERSION="3.5.0"
 SELF_NAME="remnaundersettings.sh"
 SELF_PATH="/usr/local/bin/$SELF_NAME"
 SHORTCUT="/usr/local/bin/srus"
@@ -110,13 +110,16 @@ UTF_OK=0; _probe="ЯЯ"; (( ${#_probe} == 2 )) && UTF_OK=1
 
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
   C_R=$'\033[0;31m';  C_G=$'\033[0;32m';  C_Y=$'\033[0;33m'
-  C_B=$'\033[0;36m';  C_M=$'\033[0;35m';  C_BL=$'\033[0;34m'
-  C_W=$'\033[1;37m';  C_GR=$'\033[0;90m'; C_D=$'\033[2m'
+  C_B=$'\033[0;36m';  C_M=$'\033[0;35m';  C_BL=$'\033[0;36m'
+  C_W=$'\033[1m';     C_GR=$'\033[0m';    C_D=$'\033[0m'
   C_BD=$'\033[1m';    C_N=$'\033[0m'
   C_RB=$'\033[1;31m'; C_GB=$'\033[1;32m'; C_YB=$'\033[1;33m'; C_BB=$'\033[1;36m'
+  C_LINE=$'\033[0;36m'; C_HINT=$'\033[0m'; C_KEY=$'\033[1;36m'
+  C_HEAD=$'\033[1;36m'; C_TITLE=$'\033[1m'
 else
   C_R=""; C_G=""; C_Y=""; C_B=""; C_M=""; C_BL=""; C_W=""; C_GR=""
   C_D=""; C_BD=""; C_N=""; C_RB=""; C_GB=""; C_YB=""; C_BB=""
+  C_LINE=""; C_HINT=""; C_KEY=""; C_HEAD=""; C_TITLE=""
 fi
 
 BOX_W=46
@@ -130,30 +133,30 @@ pad() {
 
 rep() { local ch="$1" n="$2" i out=""; for ((i=0;i<n;i++)); do out+="$ch"; done; printf '%s' "$out"; }
 
-box_top()  { printf '%s╭%s╮%s\n' "$C_GR" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
-box_bot()  { printf '%s╰%s╯%s\n' "$C_GR" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
-box_sep()  { printf '%s├%s┤%s\n' "$C_GR" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
-box_row()  { printf '%s│%s %s %s│%s\n' "$C_GR" "$C_N" "$(pad "$1" $((BOX_W-4)))" "$C_GR" "$C_N"; }
+box_top()  { printf '%s╭%s╮%s\n' "$C_LINE" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
+box_bot()  { printf '%s╰%s╯%s\n' "$C_LINE" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
+box_sep()  { printf '%s├%s┤%s\n' "$C_LINE" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
+box_row()  { printf '%s│%s %s %s│%s\n' "$C_LINE" "$C_N" "$(pad "$1" $((BOX_W-4)))" "$C_LINE" "$C_N"; }
 
 box_rowc() {
   local colored="$1" plain="$2"
   local n=$(( BOX_W - 4 - ${#plain} ))
   (( n < 0 )) && n=0
-  printf '%s│%s %s%*s %s│%s\n' "$C_GR" "$C_N" "$colored" "$n" "" "$C_GR" "$C_N"
+  printf '%s│%s %s%*s %s│%s\n' "$C_LINE" "$C_N" "$colored" "$n" "" "$C_LINE" "$C_N"
 }
 
-section() { printf '\n  %s%s%s\n' "$C_BD$C_BL" "$1" "$C_N"; }
+section() { printf '\n  %s%s%s\n' "$C_HEAD" "$1" "$C_N"; }
 
 item() {
   printf '   %s%s%s  %s%s%s  %s%s%s\n' \
-    "$C_BB" "$(pad "$1" 2)" "$C_N" \
-    "$C_W" "$(pad "$2" 16)" "$C_N" \
-    "$C_GR" "$3" "$C_N"
+    "$C_KEY" "$(pad "$1" 2)" "$C_N" \
+    "$C_TITLE" "$(pad "$2" 16)" "$C_N" \
+    "$C_HINT" "$3" "$C_N"
 }
 
 dot() {
   if [[ -n "$2" && "$2" != "—" ]]; then printf '%s●%s %s' "$C_G" "$C_N" "$2"
-  else printf '%s○%s %s' "$C_GR" "$C_N" "${3:-не задано}"; fi
+  else printf '%s○%s %s' "$C_Y" "$C_N" "${3:-не задано}"; fi
 }
 
 _tolog() {
@@ -166,8 +169,8 @@ ok()   { printf '  %s✓%s %s\n' "$C_GB" "$C_N" "$*"; _tolog "[+] $*"; }
 warn() { printf '  %s!%s %s\n' "$C_YB" "$C_N" "$*" >&2; _tolog "[!] $*"; }
 err()  { printf '  %s✗%s %s\n' "$C_RB" "$C_N" "$*" >&2; _tolog "[x] $*"; }
 die()  { err "$*"; exit 1; }
-dim()  { printf '    %s%s%s\n' "$C_GR" "$*" "$C_N"; }
-hr()   { printf '  %s%s%s\n' "$C_GR" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
+dim()  { printf '    %s%s%s\n' "$C_HINT" "$*" "$C_N"; }
+hr()   { printf '  %s%s%s\n' "$C_LINE" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
 
 
 DOMAIN=""; XHTTP_PORT=""; XHTTP_PATH=""; INBOUND_TAG=""
@@ -217,13 +220,13 @@ choose() {
   while (( $# >= 2 )); do labels+=("$1"); values+=("$2"); shift 2; done
   local n=${#labels[@]}
 
-  { printf '\n  %s%s%s\n' "$C_BD$C_BL" "$prompt" "$C_N"; local i
+  { printf '\n  %s%s%s\n' "$C_HEAD" "$prompt" "$C_N"; local i
     for (( i=0; i<n; i++ )); do
       if (( i+1 == def )); then
-        printf '   %s%s%s  %s%s%s %s←%s\n' "$C_BB" "$(pad "$((i+1))" 2)" "$C_N" \
-          "$C_W" "${labels[$i]}" "$C_N" "$C_GR" "$C_N"
+        printf '   %s%s%s  %s%s%s %s←%s\n' "$C_KEY" "$(pad "$((i+1))" 2)" "$C_N" \
+          "$C_TITLE" "${labels[$i]}" "$C_N" "$C_KEY" "$C_N"
       else
-        printf '   %s%s%s  %s\n' "$C_BB" "$(pad "$((i+1))" 2)" "$C_N" "${labels[$i]}"
+        printf '   %s%s%s  %s\n' "$C_KEY" "$(pad "$((i+1))" 2)" "$C_N" "${labels[$i]}"
       fi
     done; echo
   } >&2
@@ -1004,10 +1007,10 @@ pick() {
     warn "«$pre» не найден, выбирай из списка"
   fi
 
-  { printf '\n  %s%s%s\n' "$C_BD$C_BL" "$prompt" "$C_N"
+  { printf '\n  %s%s%s\n' "$C_HEAD" "$prompt" "$C_N"
     jq -r --arg lf "$lf" 'to_entries[] | "\(.key+1)\t\(.value[$lf])"' <<<"$arr" \
       | while IFS=$'\t' read -r num lbl; do
-          printf '   %s%s%s  %s\n' "$C_BB" "$(pad "$num" 2)" "$C_N" "$lbl"
+          printf '   %s%s%s  %s\n' "$C_KEY" "$(pad "$num" 2)" "$C_N" "$lbl"
         done
     echo
   } >&2
@@ -1417,16 +1420,16 @@ summary() {
   )
   echo
   box_top
-  box_rowc "$(printf '%s%s%s' "$C_BD$C_W" "ИТОГО" "$C_N")" "ИТОГО"
+  box_rowc "$(printf '%s%s%s' "$C_TITLE" "ИТОГО" "$C_N")" "ИТОГО"
   box_sep
   local r k v
   for r in "${rows[@]}"; do
     k="${r%%|*}"; v="${r#*|}"
     if (( ${#v} > BOX_W-16 )); then v="…${v: -$((BOX_W-17))}"; fi
-    box_rowc "$(printf '%s%s%s%s' "$C_GR" "$(pad "$k" 12)" "$C_N" "$v")" "$(pad "$k" 12)$v"
+    box_rowc "$(printf '%s%s%s%s' "$C_HINT" "$(pad "$k" 12)" "$C_N" "$v")" "$(pad "$k" 12)$v"
   done
   box_bot
-  printf '    %sлог: %s%s\n\n' "$C_GR" "$LOG" "$C_N"
+  printf '    %sлог: %s%s\n\n' "$C_HINT" "$LOG" "$C_N"
 }
 
 version_gt() {
@@ -1506,21 +1509,21 @@ do_update_menu() {
     clear 2>/dev/null || true
     echo
     box_top
-    box_rowc "$(printf '%s%s%s' "$C_BD$C_W" "ОБНОВЛЕНИЕ" "$C_N")" "ОБНОВЛЕНИЕ"
+    box_rowc "$(printf '%s%s%s' "$C_TITLE" "ОБНОВЛЕНИЕ" "$C_N")" "ОБНОВЛЕНИЕ"
     box_sep
-    box_rowc "$(printf '%s%s%s%s' "$C_GR" "$(pad "установлено" 14)" "$C_N" "$VERSION")" "$(pad "установлено" 14)$VERSION"
+    box_rowc "$(printf '%s%s%s%s' "$C_HINT" "$(pad "установлено" 14)" "$C_N" "$VERSION")" "$(pad "установлено" 14)$VERSION"
 
     local rv_c rv_p
     if [[ -n "$REMOTE_VERSION" ]]; then
       if [[ -n "$UPDATE_AVAILABLE" ]]; then
-        rv_c="$(printf '%s%s%s%s%s%s' "$C_GR" "$(pad "в репозитории" 14)" "$C_N" "$C_YB" "$REMOTE_VERSION" "$C_N")"
+        rv_c="$(printf '%s%s%s%s%s%s' "$C_HINT" "$(pad "в репозитории" 14)" "$C_N" "$C_YB" "$REMOTE_VERSION" "$C_N")"
         rv_p="$(pad "в репозитории" 14)$REMOTE_VERSION"
       else
-        rv_c="$(printf '%s%s%s%s  %sсвежая%s' "$C_GR" "$(pad "в репозитории" 14)" "$C_N" "$REMOTE_VERSION" "$C_G" "$C_N")"
+        rv_c="$(printf '%s%s%s%s  %sсвежая%s' "$C_HINT" "$(pad "в репозитории" 14)" "$C_N" "$REMOTE_VERSION" "$C_G" "$C_N")"
         rv_p="$(pad "в репозитории" 14)$REMOTE_VERSION  свежая"
       fi
     else
-      rv_c="$(printf '%s%s%sне проверялось' "$C_GR" "$(pad "в репозитории" 14)" "$C_N")"
+      rv_c="$(printf '%s%s%sне проверялось' "$C_HINT" "$(pad "в репозитории" 14)" "$C_N")"
       rv_p="$(pad "в репозитории" 14)не проверялось"
     fi
     box_rowc "$rv_c" "$rv_p"
@@ -1561,7 +1564,7 @@ do_update_menu() {
           confirm "Всё равно перекачать из репозитория?" || { echo; read -r -p "  Enter " _ </dev/tty; continue; }
         else
           hr
-          printf '  %s%s%s → %s%s%s\n' "$C_GR" "$VERSION" "$C_N" "$C_GB" "$UPDATE_AVAILABLE" "$C_N"
+          printf '  %s%s%s → %s%s%s\n' "$C_HINT" "$VERSION" "$C_N" "$C_GB" "$UPDATE_AVAILABLE" "$C_N"
           hr
           confirm "Обновить сейчас?" || { echo; read -r -p "  Enter " _ </dev/tty; continue; }
         fi
@@ -1582,7 +1585,7 @@ do_update_menu() {
       *) warn "Не понял команду «$c»" ;;
     esac
     echo
-    read -r -p "  ${C_GR}Enter${C_N} " _ </dev/tty
+    read -r -p "  ${C_HINT}Enter${C_N} " _ </dev/tty
   done
 }
 
@@ -1593,9 +1596,9 @@ menu() {
 
     echo
     box_top
-    box_rowc "$(printf '%s%s%s' "$C_BD$C_W" "remnaundersettings" "$C_N")$(pad "" $((BOX_W-4-18-${#VERSION}-1)))$(printf '%s%s%s' "$C_GR" "v$VERSION" "$C_N")" \
+    box_rowc "$(printf '%s%s%s' "$C_TITLE" "remnaundersettings" "$C_N")$(pad "" $((BOX_W-4-18-${#VERSION}-1)))$(printf '%s%s%s' "$C_B" "v$VERSION" "$C_N")" \
              "remnaundersettings$(pad "" $((BOX_W-4-18-${#VERSION}-1)))v$VERSION"
-    box_rowc "$(printf '%s%s%s' "$C_GR" "надстройка над eGames · Remnawave" "$C_N")" \
+    box_rowc "$(printf '%s%s%s' "$C_HINT" "надстройка над eGames · Remnawave" "$C_N")" \
              "надстройка над eGames · Remnawave"
     box_sep
 
@@ -1603,20 +1606,20 @@ menu() {
     box_rowc "$(dot 1 "$d_txt" "домен не задан")" "● $([[ -n "$DOMAIN" ]] && echo "$d_txt" || echo "домен не задан")"
 
     local net="порт ${XHTTP_PORT:-$DEFAULT_PORT} · path ${XHTTP_PATH:-—}"
-    box_rowc "$(printf '%s%s%s' "$C_GR" "$net" "$C_N")" "$net"
+    box_rowc "$(printf '%s%s%s' "$C_HINT" "$net" "$C_N")" "$net"
 
     local hw="$(cpu_cores)C / $(ram_mb) MB · профиль $prof"
-    box_rowc "$(printf '%s%s%s' "$C_GR" "$hw" "$C_N")" "$hw"
+    box_rowc "$(printf '%s%s%s' "$C_HINT" "$hw" "$C_N")" "$hw"
 
     local pan_c pan_p
     if [[ -n "$PANEL_URL" && -n "$PANEL_TOKEN" ]]; then
       pan_c="$(printf '%s✓%s панель' "$C_G" "$C_N")"; pan_p="✓ панель"
     else
-      pan_c="$(printf '%s○%s панель' "$C_GR" "$C_N")"; pan_p="○ панель"
+      pan_c="$(printf '%s○%s панель' "$C_Y" "$C_N")"; pan_p="○ панель"
     fi
     local ck_c ck_p
     if [[ -n "$PANEL_COOKIE" ]]; then ck_c="$(printf '%s✓%s гейт' "$C_G" "$C_N")"; ck_p="✓ гейт"
-    else ck_c="$(printf '%s○%s гейт' "$C_GR" "$C_N")"; ck_p="○ гейт"; fi
+    else ck_c="$(printf '%s○%s гейт' "$C_Y" "$C_N")"; ck_p="○ гейт"; fi
     box_rowc "${pan_c}   ${ck_c}" "${pan_p}   ${ck_p}"
 
     if [[ -n "$UPDATE_AVAILABLE" ]]; then
@@ -1666,12 +1669,12 @@ menu() {
       9) setup_wizard ;;
       p|P) XHTTP_PATH=""; prompt_path; save_conf ;;
       u|U) do_update_menu; continue ;;
-      0) printf '  %sПока.%s\n\n' "$C_GR" "$C_N"; exit 0 ;;
+      0) printf '  %sПока.%s\n\n' "$C_HINT" "$C_N"; exit 0 ;;
       *) warn "Не понял команду «$c»" ;;
     esac
 
     echo
-    read -r -p "  ${C_GR}Enter — назад в меню${C_N} " _ </dev/tty
+    read -r -p "  ${C_HINT}Enter — назад в меню${C_N} " _ </dev/tty
   done
 }
 
