@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 #
-# remna-node-kit.sh v3 — надстройка над install_remnawave.sh (eGamesAPI)
+# remnaundersettings.sh — надстройка над install_remnawave.sh (eGamesAPI)
+#
+# При первом запуске кладёт себя в /usr/local/bin и создаёт ярлык `srus`,
+# после чего вызывается из любого каталога командой srus.
 #
 # Запускать ПОСЛЕ того, как скрипт eGames поставил ноду.
 #
@@ -15,7 +18,10 @@
 #
 set -uo pipefail
 
-VERSION="3.1.0"
+VERSION="3.3.0"
+SELF_NAME="remnaundersettings.sh"
+SELF_PATH="/usr/local/bin/$SELF_NAME"
+SHORTCUT="/usr/local/bin/srus"
 CONF="/etc/remna-node-kit.conf"
 LOG="/var/log/remna-node-kit.log"
 BACKUP_DIR="/var/backups/remna-node-kit"
@@ -26,21 +32,78 @@ CERT_STAMP="/var/lib/remna-node-kit/cert.stamp"
 
 # ---------------------------------------------------------------- вывод ----
 
-C_R=$'\033[0;31m'; C_G=$'\033[0;32m'; C_Y=$'\033[0;33m'
-C_B=$'\033[0;36m'; C_D=$'\033[2m';   C_N=$'\033[0m'
+# ${#строка} считает байты, если локаль не UTF-8 — кириллица ломает вёрстку.
+# C.UTF-8 есть в glibc на Ubuntu 22.04+, для остальных ниже деградация.
+if locale -a 2>/dev/null | grep -qiE '^C\.utf-?8$'; then export LC_ALL=C.UTF-8
+elif locale -a 2>/dev/null | grep -qiE '^en_US\.utf-?8$'; then export LC_ALL=en_US.UTF-8
+fi
+UTF_OK=0; _probe="ЯЯ"; (( ${#_probe} == 2 )) && UTF_OK=1
+
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
+  C_R=$'\033[0;31m';  C_G=$'\033[0;32m';  C_Y=$'\033[0;33m'
+  C_B=$'\033[0;36m';  C_M=$'\033[0;35m';  C_BL=$'\033[0;34m'
+  C_W=$'\033[1;37m';  C_GR=$'\033[0;90m'; C_D=$'\033[2m'
+  C_BD=$'\033[1m';    C_N=$'\033[0m'
+  C_RB=$'\033[1;31m'; C_GB=$'\033[1;32m'; C_YB=$'\033[1;33m'; C_BB=$'\033[1;36m'
+else
+  C_R=""; C_G=""; C_Y=""; C_B=""; C_M=""; C_BL=""; C_W=""; C_GR=""
+  C_D=""; C_BD=""; C_N=""; C_RB=""; C_GB=""; C_YB=""; C_BB=""
+fi
+
+BOX_W=46
+
+# Ширина строки в символах. printf %-Ns выравнивает по байтам, поэтому
+# добиваем пробелами сами — пробел всегда однобайтовый.
+pad() {
+  local s="$1" w="$2" n
+  if (( UTF_OK )); then n=$(( w - ${#s} )); else n=$(( w - ${#s} )); fi
+  (( n < 0 )) && n=0
+  printf '%s%*s' "$s" "$n" ""
+}
+
+rep() { local ch="$1" n="$2" i out=""; for ((i=0;i<n;i++)); do out+="$ch"; done; printf '%s' "$out"; }
+
+box_top()  { printf '%s╭%s╮%s\n' "$C_GR" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
+box_bot()  { printf '%s╰%s╯%s\n' "$C_GR" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
+box_sep()  { printf '%s├%s┤%s\n' "$C_GR" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
+box_row()  { printf '%s│%s %s %s│%s\n' "$C_GR" "$C_N" "$(pad "$1" $((BOX_W-4)))" "$C_GR" "$C_N"; }
+
+# Строка в рамке, где текст уже содержит цветовые коды: ширину считаем
+# по «чистому» варианту, переданному вторым аргументом.
+box_rowc() {
+  local colored="$1" plain="$2"
+  local n=$(( BOX_W - 4 - ${#plain} ))
+  (( n < 0 )) && n=0
+  printf '%s│%s %s%*s %s│%s\n' "$C_GR" "$C_N" "$colored" "$n" "" "$C_GR" "$C_N"
+}
+
+section() { printf '\n  %s%s%s\n' "$C_BD$C_BL" "$1" "$C_N"; }
+
+item() {  # item <клавиша> <название> <подсказка>
+  printf '   %s%s%s  %s%s%s  %s%s%s\n' \
+    "$C_BB" "$(pad "$1" 2)" "$C_N" \
+    "$C_W" "$(pad "$2" 16)" "$C_N" \
+    "$C_GR" "$3" "$C_N"
+}
+
+dot() {  # dot <есть?> <текст> — зелёная точка или серая
+  if [[ -n "$2" && "$2" != "—" ]]; then printf '%s●%s %s' "$C_G" "$C_N" "$2"
+  else printf '%s○%s %s' "$C_GR" "$C_N" "${3:-не задано}"; fi
+}
 
 _tolog() {
   [[ -w "$(dirname "$LOG")" ]] || return 0
-  printf '%s %s\n' "$(date '+%F %T')" "$1" >>"$LOG" 2>/dev/null || true
+  # в лог без цветовых кодов, иначе grep по нему бесполезен
+  printf '%s %s\n' "$(date '+%F %T')" "$(sed 's/\x1b\[[0-9;]*m//g' <<<"$1")" >>"$LOG" 2>/dev/null || true
 }
 
-log()  { printf '%s[*]%s %s\n' "$C_B" "$C_N" "$*"; _tolog "[*] $*"; }
-ok()   { printf '%s[+]%s %s\n' "$C_G" "$C_N" "$*"; _tolog "[+] $*"; }
-warn() { printf '%s[!]%s %s\n' "$C_Y" "$C_N" "$*" >&2; _tolog "[!] $*"; }
-err()  { printf '%s[x]%s %s\n' "$C_R" "$C_N" "$*" >&2; _tolog "[x] $*"; }
+log()  { printf '  %s▸%s %s\n' "$C_BB" "$C_N" "$*"; _tolog "[*] $*"; }
+ok()   { printf '  %s✓%s %s\n' "$C_GB" "$C_N" "$*"; _tolog "[+] $*"; }
+warn() { printf '  %s!%s %s\n' "$C_YB" "$C_N" "$*" >&2; _tolog "[!] $*"; }
+err()  { printf '  %s✗%s %s\n' "$C_RB" "$C_N" "$*" >&2; _tolog "[x] $*"; }
 die()  { err "$*"; exit 1; }
-dim()  { printf '%s%s%s\n' "$C_D" "$*" "$C_N"; }
-hr()   { printf '%s────────────────────────────────────────%s\n' "$C_D" "$C_N"; }
+dim()  { printf '    %s%s%s\n' "$C_GR" "$*" "$C_N"; }
+hr()   { printf '  %s%s%s\n' "$C_GR" "$(rep '─' $((BOX_W-2)))" "$C_N"; }
 
 # ------------------------------------------------------------ параметры ----
 
@@ -50,7 +113,7 @@ PROFILE_NAME=""; NODE_NAME=""; SQUAD_NAME=""; HOST_REMARK=""
 TUNE_PROFILE=""; API_SCOPE=""; CERT_DIR=""
 XHTTP_MODE=""; XHTTP_ALPN=""; PATH_STYLE=""; POST_BYTES=""; ROUTE_ONLY=""
 LAST_PROFILE_UUID=""; ALL_INBOUNDS=""
-DRY_RUN=0; ASSUME_YES=0; SKIP_VALIDATE=0; EXPERT=0; ACTIONS=()
+DRY_RUN=0; ASSUME_YES=0; SKIP_VALIDATE=0; EXPERT=0; NO_INSTALL=0; ACTIONS=()
 
 DEFAULT_PORT="8445"
 
@@ -94,8 +157,15 @@ choose() {
   while (( $# >= 2 )); do labels+=("$1"); values+=("$2"); shift 2; done
   local n=${#labels[@]}
 
-  { hr; echo "$prompt"; local i
-    for (( i=0; i<n; i++ )); do printf '  %d) %s\n' "$((i+1))" "${labels[$i]}"; done
+  { printf '\n  %s%s%s\n' "$C_BD$C_BL" "$prompt" "$C_N"; local i
+    for (( i=0; i<n; i++ )); do
+      if (( i+1 == def )); then
+        printf '   %s%s%s  %s%s%s %s←%s\n' "$C_BB" "$(pad "$((i+1))" 2)" "$C_N" \
+          "$C_W" "${labels[$i]}" "$C_N" "$C_GR" "$C_N"
+      else
+        printf '   %s%s%s  %s\n' "$C_BB" "$(pad "$((i+1))" 2)" "$C_N" "${labels[$i]}"
+      fi
+    done; echo
   } >&2
 
   if (( ASSUME_YES )); then printf '%s' "${values[$((def-1))]}"; return 0; fi
@@ -921,7 +991,13 @@ pick() {  # pick <json-array> <label> <value> <prompt> <preselect>
     warn "«$pre» не найден, выбирай из списка"
   fi
 
-  { hr; echo "$prompt:"; jq -r --arg lf "$lf" 'to_entries[] | "  \(.key+1)) \(.value[$lf])"' <<<"$arr"; } >&2
+  { printf '\n  %s%s%s\n' "$C_BD$C_BL" "$prompt" "$C_N"
+    jq -r --arg lf "$lf" 'to_entries[] | "\(.key+1)\t\(.value[$lf])"' <<<"$arr" \
+      | while IFS=$'\t' read -r num lbl; do
+          printf '   %s%s%s  %s\n' "$C_BB" "$(pad "$num" 2)" "$C_N" "$lbl"
+        done
+    echo
+  } >&2
   local i
   while :; do
     i=$(ask "  номер" "1")
@@ -1056,7 +1132,7 @@ do_xhttp_api() {
 
   api_write PATCH /config-profiles \
     "$(jq -n --arg u "$pu" --argjson c "$newcfg" '{uuid:$u, config:$c}')" \
-    "Патч профиля" >/dev/null || { err "Откат: $0 --rollback"; return 1; }
+    "Патч профиля" >/dev/null || { err "Откат: srus --rollback"; return 1; }
 
   # Панель может ответить 200 и молча выбросить тело (whitelist в DTO).
   # Поэтому не верим коду ответа — перечитываем профиль и ищем свой тег.
@@ -1348,39 +1424,87 @@ do_rollback() {
 # ======================================================================
 
 summary() {
-  hr
-  cat <<EOF
-  домен : ${DOMAIN:-—}
-  порт  : ${XHTTP_PORT:-—}
-  path  : ${XHTTP_PATH:-—}
-  tag   : ${INBOUND_TAG:-—}
-  mode  : ${XHTTP_MODE:-—} · alpn ${XHTTP_ALPN:-—} · post ${POST_BYTES:-—}
-  серт  : ${CERT_IN_CONTAINER:-—}
-  лог   : $LOG
-EOF
-  hr
+  local rows=(
+    "домен|${DOMAIN:-—}"
+    "порт|${XHTTP_PORT:-—}"
+    "path|${XHTTP_PATH:-—}"
+    "тег|${INBOUND_TAG:-—}"
+    "транспорт|${XHTTP_MODE:-—} · ${XHTTP_ALPN:-—}"
+    "сертификат|${CERT_IN_CONTAINER:-—}"
+  )
+  echo
+  box_top
+  box_rowc "$(printf '%s%s%s' "$C_BD$C_W" "ИТОГО" "$C_N")" "ИТОГО"
+  box_sep
+  local r k v
+  for r in "${rows[@]}"; do
+    k="${r%%|*}"; v="${r#*|}"
+    # длинный путь к серту обрезаем с головы, хвост информативнее
+    if (( ${#v} > BOX_W-16 )); then v="…${v: -$((BOX_W-17))}"; fi
+    box_rowc "$(printf '%s%s%s%s' "$C_GR" "$(pad "$k" 12)" "$C_N" "$v")" "$(pad "$k" 12)$v"
+  done
+  box_bot
+  printf '    %sлог: %s%s\n\n' "$C_GR" "$LOG" "$C_N"
 }
 
 menu() {
   while :; do
-    hr
-    printf '%s remna-node-kit %s%s\n' "$C_B" "$VERSION" "$C_N"
-    dim "  ${DOMAIN:-домен не задан} · порт ${XHTTP_PORT:-$DEFAULT_PORT} · $(cpu_cores) ядер / $(ram_mb) MB · профиль $(detect_tune_profile)"
-    hr
-    cat <<'EOT'
-  1) Тюнинг хоста (sysctl, conntrack, RPS/RFS)
-  2) Фаервол UFW
-  3) Сертификаты + volume + хук продления
-  4) xHTTP-инбаунд → в панель по API
-  5) xHTTP-инбаунд → показать JSON
-  6) Всё подряд: 1 → 2 → 3 → 4
-  7) Постфлайт-проверка
-  8) Откатить профиль из бэкапа
-  9) Задать параметры
-  p) Новый рандомный path
-  0) Выход
-EOT
-    case "$(ask "  выбор" "")" in
+    clear 2>/dev/null || true
+    local prof; prof=$(detect_tune_profile)
+
+    echo
+    box_top
+    box_rowc "$(printf '%s%s%s' "$C_BD$C_W" "remnaundersettings" "$C_N")$(pad "" $((BOX_W-4-18-${#VERSION}-1)))$(printf '%s%s%s' "$C_GR" "v$VERSION" "$C_N")" \
+             "remnaundersettings$(pad "" $((BOX_W-4-18-${#VERSION}-1)))v$VERSION"
+    box_rowc "$(printf '%s%s%s' "$C_GR" "надстройка над eGames · Remnawave" "$C_N")" \
+             "надстройка над eGames · Remnawave"
+    box_sep
+
+    local d_txt="${DOMAIN:-—}"
+    box_rowc "$(dot 1 "$d_txt" "домен не задан")" "● $([[ -n "$DOMAIN" ]] && echo "$d_txt" || echo "домен не задан")"
+
+    local net="порт ${XHTTP_PORT:-$DEFAULT_PORT} · path ${XHTTP_PATH:-—}"
+    box_rowc "$(printf '%s%s%s' "$C_GR" "$net" "$C_N")" "$net"
+
+    local hw="$(cpu_cores)C / $(ram_mb) MB · профиль $prof"
+    box_rowc "$(printf '%s%s%s' "$C_GR" "$hw" "$C_N")" "$hw"
+
+    local pan_c pan_p
+    if [[ -n "$PANEL_URL" && -n "$PANEL_TOKEN" ]]; then
+      pan_c="$(printf '%s✓%s панель' "$C_G" "$C_N")"; pan_p="✓ панель"
+    else
+      pan_c="$(printf '%s○%s панель' "$C_GR" "$C_N")"; pan_p="○ панель"
+    fi
+    local ck_c ck_p
+    if [[ -n "$PANEL_COOKIE" ]]; then ck_c="$(printf '%s✓%s гейт' "$C_G" "$C_N")"; ck_p="✓ гейт"
+    else ck_c="$(printf '%s○%s гейт' "$C_GR" "$C_N")"; ck_p="○ гейт"; fi
+    box_rowc "${pan_c}   ${ck_c}" "${pan_p}   ${ck_p}"
+
+    box_bot
+
+    section "ХОСТ"
+    item "1" "Тюнинг ядра"     "sysctl · conntrack"
+    item "2" "Фаервол"         "UFW · порт панели"
+
+    section "ИНБАУНД"
+    item "3" "Сертификаты"     "поиск · volume"
+    item "4" "Залить в панель" "через API"
+    item "5" "Показать JSON"   "вставить руками"
+
+    section "ПРОВЕРКА"
+    item "7" "Постфлайт"       "логи · порт · TLS"
+    item "8" "Откат профиля"   "из бэкапа"
+
+    section "ПРОЧЕЕ"
+    item "6" "Всё подряд"      "1 → 2 → 3 → 4"
+    item "9" "Параметры"       "домен · токен"
+    item "p" "Новый path"      "перегенерация"
+    item "0" "Выход"           ""
+    echo
+
+    local c; c=$(ask "  выбор" "")
+    echo
+    case "$c" in
       1) do_tune ;;
       2) do_firewall; save_conf ;;
       3) do_certs; save_conf ;;
@@ -1391,9 +1515,12 @@ EOT
       8) do_rollback ;;
       9) setup_wizard ;;
       p|P) XHTTP_PATH=""; prompt_path; save_conf ;;
-      0) exit 0 ;;
-      *) warn "Не понял" ;;
+      0) printf '  %sПока.%s\n\n' "$C_GR" "$C_N"; exit 0 ;;
+      *) warn "Не понял команду «$c»" ;;
     esac
+
+    echo
+    read -r -p "  ${C_GR}Enter — назад в меню${C_N} " _ </dev/tty
   done
 }
 
@@ -1409,10 +1536,10 @@ setup_wizard() {
 
 usage() {
   cat <<EOF
-remna-node-kit $VERSION — надстройка над install_remnawave.sh (eGames)
+remnaundersettings $VERSION — надстройка над install_remnawave.sh (eGames)
 
-  $0                     интерактивное меню
-  $0 --all -y --domain d.tld --panel-url … --token … --panel-ip …
+  srus                   интерактивное меню
+  srus --all -y --domain d.tld --panel-url … --token … --panel-ip …
 
 Действия:
   --tune          sysctl под профиль железа (base / dual / tiny)
@@ -1448,6 +1575,7 @@ remna-node-kit $VERSION — надстройка над install_remnawave.sh (eG
   --remark X      название Host в панели
   --expert        спрашивать тонкие параметры транспорта без лишнего вопроса
   --skip-validate не гонять xray -test перед заливкой
+  --no-install    не копировать себя в /usr/local/bin и не делать ярлык srus
   --dry-run       ничего не менять, только показать
   -y, --yes       не переспрашивать
 EOF
@@ -1486,6 +1614,7 @@ while [[ $# -gt 0 ]]; do
     --remark) HOST_REMARK="$2"; shift ;;
     --expert) EXPERT=1 ;;
     --skip-validate) SKIP_VALIDATE=1 ;;
+    --no-install) NO_INSTALL=1 ;;
     --dry-run) DRY_RUN=1 ;;
     -y|--yes) ASSUME_YES=1 ;;
     -h|--help) usage; exit 0 ;;
@@ -1496,9 +1625,47 @@ done
 
 # ------------------------------------------------------------- запуск ----
 
+# Кладёт себя в /usr/local/bin под родным именем и вешает короткий ярлык srus.
+# Симлинк, а не alias: работает в любой оболочке, под sudo и в cron,
+# и не требует перечитывать ~/.bashrc.
+self_install() {
+  (( NO_INSTALL )) && return 0
+  local src
+  src=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null) || src=$(readlink -f "$0" 2>/dev/null)
+  [[ -f "$src" ]] || return 0
+
+  if [[ "$src" != "$SELF_PATH" ]]; then
+    # через временный файл + mv: rename атомарен и не рвёт уже запущенный процесс
+    if cp "$src" "$SELF_PATH.tmp" 2>/dev/null && chmod 755 "$SELF_PATH.tmp" 2>/dev/null \
+       && mv -f "$SELF_PATH.tmp" "$SELF_PATH" 2>/dev/null; then
+      ok "Установлен: $SELF_PATH"
+    else
+      rm -f "$SELF_PATH.tmp" 2>/dev/null
+      return 0
+    fi
+  else
+    chmod 755 "$SELF_PATH" 2>/dev/null
+  fi
+
+  if [[ -L "$SHORTCUT" ]]; then
+    # ярлык есть — молча освежаем цель на случай переезда
+    ln -sfn "$SELF_PATH" "$SHORTCUT" 2>/dev/null
+  elif [[ -e "$SHORTCUT" ]]; then
+    warn "$SHORTCUT занят посторонним файлом — ярлык не трогаю"
+  else
+    if ln -s "$SELF_PATH" "$SHORTCUT" 2>/dev/null; then
+      hr
+      ok "Готово. Дальше запускай откуда угодно одной командой:"
+      printf '    %ssrus%s\n' "$C_G" "$C_N"
+      hr
+    fi
+  fi
+}
+
 load_conf
 need_root
 touch "$LOG" 2>/dev/null; chmod 600 "$LOG" 2>/dev/null || true
+self_install
 _tolog "=== запуск v$VERSION: ${ACTIONS[*]:-меню} ==="
 
 ensure_deps
