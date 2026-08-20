@@ -3,7 +3,7 @@
 # remnaundersettings — надстройка над install_remnawave.sh (eGamesAPI)
 # для нод Remnawave на Xray-core.
 #
-# Версия 3.5.2
+# Версия 3.6.0
 #
 #
 # НАЗНАЧЕНИЕ
@@ -47,6 +47,13 @@
 #                    слушается ли порт, TLS-рукопожатие снаружи с нужным
 #                    SNI, заполненность conntrack.
 #
+#   Оптимизация      Приводит профиль к эталону: log, dns на plain UDP,
+#                    sockopt с BBR на инбаундах и DIRECT, блокировка
+#                    bittorrent и приватных диапазонов, policy. Значения
+#                    заменяются, отсутствующие добавляются, совпадающие
+#                    не трогаются. Чужие аутбаунды и правила роутинга,
+#                    включая мульти-хоп, сохраняются.
+#
 #   Откат            Возврат профиля из бэкапа одной командой.
 #
 #   Обновление       Сверяет свою версию со строкой VERSION в репозитории
@@ -85,7 +92,7 @@
 #
 set -uo pipefail
 
-VERSION="3.5.2"
+VERSION="3.6.0"
 SELF_NAME="remnaundersettings.sh"
 SELF_PATH="/usr/local/bin/$SELF_NAME"
 SHORTCUT="/usr/local/bin/srus"
@@ -1096,6 +1103,135 @@ base_profile_config() {
   }'
 }
 
+opt_sockopt() {
+  jq -n '{tcpNoDelay:true, tcpFastOpen:true, tcpCongestion:"bbr",
+          tcpUserTimeout:10000, tcpKeepAliveIdle:30, tcpKeepAliveInterval:15}'
+}
+
+opt_dns() {
+  jq -n '{servers:[{tag:"cloudflare-dns-udp", address:"1.1.1.1"},
+                   {tag:"google-dns-udp", address:"8.8.8.8"}],
+          disableCache:false, queryStrategy:"UseIPv4",
+          disableFallback:false, disableFallbackIfMatch:true}'
+}
+
+opt_policy() {
+  jq -n --argjson buf "$(buffer_size)" \
+    '{connIdle:240, handshake:8, bufferSize:$buf, uplinkOnly:2, downlinkOnly:5}'
+}
+
+opt_cidr() {
+  jq -n '["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16",
+          "169.254.0.0/16","100.64.0.0/10","0.0.0.0/8","224.0.0.0/3",
+          "::1/128","fc00::/7","fe80::/10"]'
+}
+
+optimize_config() {
+  local cfg="$1"
+  jq --argjson so "$(opt_sockopt)" --argjson dns "$(opt_dns)" \
+     --argjson pol "$(opt_policy)" --argjson cidr "$(opt_cidr)" '
+    .log.access = "none"
+    | .log.loglevel = "error"
+    | .dns = $dns
+    | .inbounds = [ (.inbounds // [])[]
+        | .streamSettings.sockopt = ((.streamSettings.sockopt // {}) + $so) ]
+    | .outbounds = (
+        (.outbounds // [])
+        | if any(.[]; .tag == "DIRECT")
+          then map(if .tag == "DIRECT"
+                   then .protocol = "freedom"
+                        | .settings.domainStrategy = "UseIPv4"
+                        | .streamSettings.sockopt = ((.streamSettings.sockopt // {}) + $so)
+                   else . end)
+          else . + [{tag:"DIRECT", protocol:"freedom",
+                     settings:{domainStrategy:"UseIPv4"},
+                     streamSettings:{sockopt:$so}}]
+          end)
+    | .outbounds = (if any(.outbounds[]; .tag == "BLOCK")
+                    then .outbounds
+                    else .outbounds + [{tag:"BLOCK", protocol:"blackhole"}] end)
+    | .routing.domainMatcher = "hybrid"
+    | .routing.domainStrategy = "IPIfNonMatch"
+    | .routing.rules = (
+        ((.routing.rules // [])
+          | map(select(
+              (((.outboundTag // "") == "BLOCK")
+               and ((((.ip // []) | index("geoip:private")) != null)
+                    or (((.ip // []) | index("127.0.0.0/8")) != null)
+                    or (((.protocol // []) | index("bittorrent")) != null))) | not))
+        ) as $rest
+        | [{type:"field", protocol:["bittorrent"], outboundTag:"BLOCK"},
+           {type:"field", ip:$cidr, outboundTag:"BLOCK"}] + $rest)
+    | .policy.levels."0" = ((.policy.levels."0" // {}) + $pol)
+  ' <<<"$cfg"
+}
+
+config_diff_sections() {
+  local before="$1" after="$2" k a b changed=0
+  for k in log dns inbounds outbounds routing policy; do
+    a=$(jq -S ".$k // null" <<<"$before"); b=$(jq -S ".$k // null" <<<"$after")
+    if [[ "$a" != "$b" ]]; then printf '    · %s\n' "$k"; changed=1; fi
+  done
+  return $(( changed == 0 ))
+}
+
+do_optimize() {
+  ensure_deps
+  api_preflight || return 1
+
+  local profiles pu cfg newcfg
+  profiles=$(api GET /config-profiles | jq '.response.configProfiles // .response')
+  pu=$(pick "$profiles" name uuid "Config Profile для оптимизации" "$PROFILE_NAME") || return 1
+  cfg=$(api GET "/config-profiles/$pu" | jq '.response.config')
+  [[ "$cfg" == "null" || -z "$cfg" ]] && { err "Не смог прочитать config профиля."; return 1; }
+
+  newcfg=$(optimize_config "$cfg") || { err "jq не смог применить оптимизацию."; return 1; }
+
+  if [[ "$(jq -S . <<<"$cfg")" == "$(jq -S . <<<"$newcfg")" ]]; then
+    ok "Профиль уже соответствует эталону — менять нечего"
+    return 0
+  fi
+
+  hr
+  printf '  %sИзменятся секции:%s\n' "$C_TITLE" "$C_N"
+  config_diff_sections "$cfg" "$newcfg"
+  hr
+
+  local buf; buf=$(buffer_size)
+  if [[ "$buf" != "512" ]]; then
+    warn "bufferSize ставлю $buf вместо 512 — на ноде $(ram_mb) MB RAM"
+  fi
+
+  local rules_kept
+  rules_kept=$(jq '[(.routing.rules // [])[] | select(.outboundTag != "BLOCK")] | length' <<<"$cfg")
+  (( rules_kept > 0 )) && dim "прочих правил роутинга сохранено: $rules_kept"
+
+  local outs
+  outs=$(jq -r '[(.outbounds // [])[] | select(.tag != "DIRECT" and .tag != "BLOCK") | .tag] | join(", ")' <<<"$cfg")
+  [[ -n "$outs" ]] && dim "прочие аутбаунды сохранены: $outs"
+
+  mkdir -p "$BACKUP_DIR"
+  local bk="$BACKUP_DIR/profile-${pu}-$(date +%Y%m%d-%H%M%S).json"
+  jq . <<<"$cfg" >"$bk"; ok "Бэкап: $bk"
+
+  validate_config "$newcfg" || { warn "Отменено. Профиль не тронут."; return 1; }
+  confirm "Применить оптимизацию?" || { warn "Отменено"; return 1; }
+
+  api_write PATCH /config-profiles \
+    "$(jq -n --arg u "$pu" --argjson c "$newcfg" '{uuid:$u, config:$c}')" \
+    "Оптимизация профиля" >/dev/null || { err "Откат: srus --rollback"; return 1; }
+
+  local check
+  check=$(api GET "/config-profiles/$pu" 2>/dev/null | jq -r '.response.config.log.loglevel // empty')
+  if [[ "$check" == "error" ]]; then
+    ok "Оптимизация применена"
+  else
+    err "PATCH прошёл, но профиль не изменился — панель отбросила тело запроса"
+    return 1
+  fi
+  return 0
+}
+
 do_xhttp_api() {
   ensure_deps
   api_preflight || return 1
@@ -1692,13 +1828,14 @@ menu() {
     item "3" "Сертификаты"     "поиск · volume"
     item "4" "Залить в панель" "через API"
     item "5" "Показать JSON"   "вставить руками"
+    item "o" "Оптимизация"     "log · dns · sockopt"
 
     section "ПРОВЕРКА"
     item "7" "Постфлайт"       "логи · порт · TLS"
     item "8" "Откат профиля"   "из бэкапа"
 
     section "ПРОЧЕЕ"
-    item "6" "Всё подряд"      "1 → 2 → 3 → 4"
+    item "6" "Всё подряд"      "1→2→3→4→o"
     item "9" "Параметры"       "домен · токен"
     item "p" "Новый path"      "перегенерация"
     if [[ -n "$UPDATE_AVAILABLE" ]]; then
@@ -1717,7 +1854,8 @@ menu() {
       3) do_certs; save_conf ;;
       4) do_xhttp_api; save_conf ;;
       5) do_xhttp_print; save_conf ;;
-      6) do_tune; do_firewall; do_certs; do_xhttp_api; save_conf ;;
+      o|O) do_optimize ;;
+      6) do_tune; do_firewall; do_certs; do_xhttp_api; do_optimize; save_conf ;;
       7) do_postflight ;;
       8) do_rollback ;;
       9) setup_wizard ;;
@@ -1755,11 +1893,12 @@ remnaundersettings $VERSION — надстройка над install_remnawave.sh
   --certs         найти серты, смонтировать, повесить хук продления
   --xhttp         собрать инбаунд, проверить, залить в панель
   --print         собрать инбаунд и вывести JSON
+  --optimize      привести профиль к эталону: log, dns, sockopt, routing, policy
   --postflight    проверить живость: логи, порт, TLS, conntrack
   --rollback      откатить профиль из бэкапа
   --check-update  сверить версию с репозиторием
   --update        обновить скрипт, если в репозитории новее
-  --all           tune + firewall + certs + xhttp
+  --all           tune + firewall + certs + xhttp + optimize
 
 Параметры:
   --domain X      SelfSteal-домен (SNI, Host)
@@ -1797,10 +1936,11 @@ while [[ $# -gt 0 ]]; do
     --firewall) ACTIONS+=(firewall) ;;
     --certs) ACTIONS+=(certs) ;;
     --xhttp) ACTIONS+=(xhttp) ;;
+    --optimize) ACTIONS+=(optimize) ;;
     --print) ACTIONS+=(print) ;;
     --postflight) ACTIONS+=(postflight) ;;
     --rollback) ACTIONS+=(rollback) ;;
-    --all) ACTIONS+=(tune firewall certs xhttp) ;;
+    --all) ACTIONS+=(tune firewall certs xhttp optimize) ;;
     --domain) DOMAIN="$2"; shift ;;
     --port) XHTTP_PORT="$2"; shift ;;
     --path) XHTTP_PATH="$2"; shift ;;
@@ -1885,6 +2025,7 @@ else
       firewall) do_firewall ;;
       certs) do_certs ;;
       xhttp) do_xhttp_api ;;
+      optimize) do_optimize ;;
       print) do_xhttp_print ;;
       postflight) do_postflight ;;
       rollback) do_rollback ;;
